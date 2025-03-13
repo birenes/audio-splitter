@@ -23,17 +23,22 @@ global_diarization_pipeline = None
 
 
 # Função tradicional de segmentação (separa com base em períodos de silêncio)
+# Alterado para realizar normalização a -1dB em vez de compressão dinâmica.
+# Adicionados dois novos parâmetros:
+#   - trigger_silence: quantidade de silêncio (em ms) para ativar o corte do áudio.
+#   - post_cut_silence: quantidade de silêncio (em ms) a ser mantido no final do segmento para evitar cortes abruptos.
 def process_audio_file(audio_file_path, min_segment_duration=3, silence_thresh=-40,
-                       noise_threshold=-20, output_format="wav", keep_silence=500):
+                       noise_threshold=-20, output_format="wav", trigger_silence=1000, post_cut_silence=500):
     
     audio = AudioSegment.from_file(audio_file_path)
-    audio = effects.compress_dynamic_range(audio)
+    # Substituindo compress_dynamic_range por normalização a -1 dB
+    audio = effects.normalize(audio, headroom=1.0)
     
     segments = silence.split_on_silence(
         audio, 
-        min_silence_len=1000, 
+        min_silence_len=trigger_silence,  # Controla a quantidade de silêncio necessária para ativar o corte
         silence_thresh=silence_thresh, 
-        keep_silence=keep_silence
+        keep_silence=post_cut_silence  # Controla o tempo de corte final (silêncio mantido) para evitar cortes abruptos
     )
     final_segments = []
     for seg in segments:
@@ -42,9 +47,9 @@ def process_audio_file(audio_file_path, min_segment_duration=3, silence_thresh=-
         if seg.dBFS is not None and seg.dBFS > noise_threshold:
             sub_segments = silence.split_on_silence(
                 seg, 
-                min_silence_len=300, 
+                min_silence_len=300,  # Valor fixo para sub-segmentação
                 silence_thresh=silence_thresh, 
-                keep_silence=keep_silence
+                keep_silence=post_cut_silence
             )
             for sub_seg in sub_segments:
                 if len(sub_seg) >= min_segment_duration * 1000:
@@ -71,7 +76,8 @@ def process_audio_file(audio_file_path, min_segment_duration=3, silence_thresh=-
 
 
 # Função experimental de diarização utilizando pyannote.audio
-def process_audio_file_diarization(audio_file_path, min_segment_duration=3, output_format="wav"):
+# Atualizada para receber os novos parâmetros de trigger_silence e post_cut_silence
+def process_audio_file_diarization(audio_file_path, min_segment_duration=3, output_format="wav", silence_thresh=-40, noise_threshold=-20, trigger_silence=1000, post_cut_silence=500):
     global global_diarization_pipeline
     try:
         from pyannote.audio import Pipeline
@@ -82,8 +88,7 @@ def process_audio_file_diarization(audio_file_path, min_segment_duration=3, outp
             global_diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization", use_auth_token=token)
     except Exception as e:
         print("Falha ao carregar pyannote.audio, utilizando método tradicional:", e)
-        return process_audio_file(audio_file_path, min_segment_duration, silence_thresh=-40,
-                                  noise_threshold=-20, output_format=output_format)
+        return process_audio_file(audio_file_path, min_segment_duration, silence_thresh, noise_threshold, output_format, trigger_silence, post_cut_silence)
     
     diarization = global_diarization_pipeline(audio_file_path)
     audio = AudioSegment.from_file(audio_file_path)
@@ -111,7 +116,7 @@ def process_audio_file_diarization(audio_file_path, min_segment_duration=3, outp
 
 # Função principal de processamento. Organiza os segmentos em pastas e constrói um dicionário para preview
 def process_audio_files(audio_files, min_segment_duration, silence_thresh, noise_threshold,
-                        output_format, experimental_diarization, keep_silence):
+                        output_format, experimental_diarization, trigger_silence, post_cut_silence):
     output_dir = tempfile.mkdtemp(prefix="audio_split_")
     preview_info = {}  # chave: nome base do arquivo; valor: se diarização -> dict {speaker: [lista de arquivos]}, senão -> lista de arquivos
     
@@ -121,7 +126,7 @@ def process_audio_files(audio_files, min_segment_duration, silence_thresh, noise
         os.makedirs(subfolder_path, exist_ok=True)
         
         if experimental_diarization:
-            segments_by_speaker = process_audio_file_diarization(file_path, min_segment_duration, output_format)
+            segments_by_speaker = process_audio_file_diarization(file_path, min_segment_duration, output_format, silence_thresh, noise_threshold, trigger_silence, post_cut_silence)
             if isinstance(segments_by_speaker, list):
                 file_paths = []
                 for seg_name, temp_path in segments_by_speaker:
@@ -143,7 +148,7 @@ def process_audio_files(audio_files, min_segment_duration, silence_thresh, noise
                 preview_info[base_name] = speaker_dict
         else:
             segments = process_audio_file(file_path, min_segment_duration, silence_thresh,
-                                          noise_threshold, output_format, keep_silence)
+                                          noise_threshold, output_format, trigger_silence, post_cut_silence)
             file_paths = []
             for seg_name, temp_path in segments:
                 destination = os.path.join(subfolder_path, seg_name)
@@ -210,7 +215,11 @@ with gr.Blocks() as demo:
         format_input = gr.Dropdown(label="Formato de Saída", choices=["wav", "mp3", "flac", "ogg"], value="wav")
         experimental_checkbox = gr.Checkbox(label="Experimental: Diarização de Voz", value=False)
     with gr.Row():
-        keep_silence_input = gr.Slider(minimum=0, maximum=1000, step=50, label="Intervalo do Corte (ms)", value=500)
+        # Slider para definir o tempo de corte final (silêncio mantido ao final do segmento)
+        post_cut_silence_input = gr.Slider(minimum=0, maximum=1000, step=50, label="Tempo de Corte Final (ms)", value=500)
+    with gr.Row():
+        # Slider para definir a quantidade de silêncio que ativa o corte (trigger)
+        trigger_silence_input = gr.Slider(minimum=0, maximum=5000, step=100, label="Duração de Silêncio para Ativar Corte (ms)", value=1000)
     
     process_btn = gr.Button("Processar Áudios")
     with gr.Row():
@@ -218,18 +227,18 @@ with gr.Blocks() as demo:
     gr.Markdown("### Preview dos Áudios Cortados")
     preview_output = gr.HTML(value="")
     
-    def run_all(audio_files, min_seg, silence_thresh, noise_thresh, out_format, experimental, keep_silence):
+    def run_all(audio_files, min_seg, silence_thresh, noise_thresh, out_format, experimental, trigger_silence, post_cut_silence):
         if not audio_files:
             return None, ""
         zip_path, preview_info, out_format = process_audio_files(
-            audio_files, min_seg, silence_thresh, noise_thresh, out_format, experimental, keep_silence
+            audio_files, min_seg, silence_thresh, noise_thresh, out_format, experimental, trigger_silence, post_cut_silence
         )
         preview_html = build_preview_html(preview_info, experimental, out_format)
         return zip_path, preview_html
 
     process_btn.click(
         fn=run_all,
-        inputs=[audio_input, min_seg_input, silence_thresh_input, noise_threshold_input, format_input, experimental_checkbox, keep_silence_input],
+        inputs=[audio_input, min_seg_input, silence_thresh_input, noise_threshold_input, format_input, experimental_checkbox, trigger_silence_input, post_cut_silence_input],
         outputs=[zip_output, preview_output]
     )
 
