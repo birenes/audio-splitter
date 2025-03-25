@@ -1,0 +1,7 @@
+gradio>=3.0.0
+ffmpeg>=1.4
+pydub>=0.25.1
+pyannote.audio>=2.1
+torch>=1.10.0
+torchaudio>=0.10.0
+python-dotenv>=0.20.0
